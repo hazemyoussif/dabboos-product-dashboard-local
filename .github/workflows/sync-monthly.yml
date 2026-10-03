@@ -1,0 +1,109 @@
+# The drift sweep -- the half the old pipeline never had.
+#
+# A nightly upsert can never DELETE. When an invoice is cancelled it does not
+# change in account.invoice.report, it DISAPPEARS from it, so its rows survive
+# every subsequent run forever and keep inflating revenue. Measured on this
+# database before the first reconciliation: 150,093 rows where Odoo had
+# 120,809. Twenty-nine thousand phantom lines, and nothing in the pipeline
+# able to remove them, because n8n's backfill was written once and never
+# scheduled to repeat.
+#
+# `backfill --replace` deletes each month before inserting it, which is the
+# only operation that removes a row that no longer exists upstream. The
+# nightly window already does this for the last 35 days. This job extends it
+# past that, where nothing else is looking.
+#
+# It also re-reads branch sales and branch revenue at full depth. The daily
+# run reads three months of those on purpose; this is where the other
+# twenty-four get corrected.
+
+name: sync-monthly
+
+on:
+  schedule:
+    # 01:00 UTC on the 1st = 04:00 Asia/Baghdad, an hour behind the daily run.
+    # They share a concurrency group, so if the daily overruns this one waits
+    # rather than racing it.
+    - cron: '0 1 1 * *'
+  workflow_dispatch:
+    inputs:
+      months:
+        description: 'Complete months to re-read and replace (3 = normal sweep, 27 = whole history)'
+        required: false
+        default: '3'
+
+concurrency:
+  group: odoosync
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: sync/requirements.txt
+
+      - name: Install
+        working-directory: sync
+        run: pip install -r requirements.txt
+
+      - name: Work out the window
+        id: window
+        run: |
+          MONTHS="${{ github.event.inputs.months || '3' }}"
+          # From the 1st of the month MONTHS back, through tomorrow. `--to` is
+          # exclusive, so tomorrow means "including everything dated today".
+          FROM=$(date -u -d "$(date -u +%Y-%m-01) -${MONTHS} months" +%Y-%m-%d)
+          TO=$(date -u -d "tomorrow" +%Y-%m-%d)
+          echo "from=$FROM" >> "$GITHUB_OUTPUT"
+          echo "to=$TO"     >> "$GITHUB_OUTPUT"
+          echo "Replacing invoice lines from $FROM up to (not including) $TO"
+
+      - name: Replace invoice lines
+        working-directory: sync
+        env:
+          ENGINE_URL: ${{ secrets.ENGINE_URL }}
+          ENGINE_API_KEY: ${{ secrets.ENGINE_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          TIMEZONE: Asia/Baghdad
+        run: |
+          python -m odoosync backfill --replace \
+            --from "${{ steps.window.outputs.from }}" \
+            --to   "${{ steps.window.outputs.to }}" -v
+
+      - name: Full branch sweep
+        working-directory: sync
+        env:
+          ENGINE_URL: ${{ secrets.ENGINE_URL }}
+          ENGINE_API_KEY: ${{ secrets.ENGINE_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          TIMEZONE: Asia/Baghdad
+        # No --months: the standalone default is the full 27.
+        run: |
+          python -m odoosync branch-sales -v
+          python -m odoosync branch-revenue -v
+
+      - name: Rebuild the summaries over the same window
+        working-directory: sync
+        env:
+          ENGINE_URL: ${{ secrets.ENGINE_URL }}
+          ENGINE_API_KEY: ${{ secrets.ENGINE_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          TIMEZONE: Asia/Baghdad
+        # --since is the whole point of this step. Plain `refresh` calls
+        # refresh_after_sync(), which rebuilds a FIXED two months. A three-month
+        # replace would then correct the invoice lines and leave the oldest
+        # month's summary holding the old numbers -- and the pages read the
+        # summaries, so the correction would never reach a screen. Passing the
+        # backfill's own start date rebuilds exactly what was replaced.
+        run: python -m odoosync refresh --since "${{ steps.window.outputs.from }}" -v

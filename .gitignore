@@ -1,0 +1,50 @@
+# secrets — never commit
+.env
+.env.*
+!.env.example
+*.secret
+credentials.json
+
+# Generated key files. engine.key.js declared itself "GENERATED, GITIGNORED"
+# in its own first line and was committed anyway, because nothing here matched
+# it — and vercel.json restricts no routes, so it was served to the internet at
+# /assets/js/engine.key.js with HTTP 200. A comment is not an ignore rule.
+# The glob is deliberately wider than the one file that got caught.
+*.key.js
+
+# os / editor
+Thumbs.db
+Desktop.ini
+.DS_Store
+.vscode/
+.idea/
+
+# node (only used for running tests)
+node_modules/
+npm-debug.log*
+
+# scratch
+tmp/
+*.local.*
+
+# transfer artifacts -- e.g. a zipped copy of sync/ carries its .env inside,
+# and a stray `git add -A` would commit the secrets the .env rule is meant to
+# stop. Keep the archive out entirely.
+*.zip
+wetransfer_*/
+
+# supabase CLI scratch state — records which project this machine is linked to.
+# Machine-specific, and .temp/ can hold access tokens.
+supabase/.temp/
+
+__pycache__/
+*.py[cod]
+
+# nightly sync logs -- local run history, not source
+sync/logs/
+
+# database dumps -- a full copy of the business. The handover pack that writes
+# them lives OUTSIDE this repo, but keep the rule: a dump must never reach a
+# remote, whatever produced it or where it was dropped.
+*.dump
+*.dump.gz

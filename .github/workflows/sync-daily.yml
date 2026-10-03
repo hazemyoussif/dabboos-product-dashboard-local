@@ -1,0 +1,84 @@
+# Odoo -> Supabase, once a night.
+#
+# This file is the thing that was missing. Every number on the dashboard was
+# correct only until someone ran `python -m odoosync all` by hand, and the
+# pipeline it replaced had the same shape of gap: n8n ran the upserts but its
+# backfill was never scheduled to repeat, so drift accumulated with nothing
+# able to correct it. See sync-monthly.yml for that half.
+#
+# WHY GITHUB ACTIONS. The sync is a plain CLI by design -- odoosync/__main__.py
+# says the trigger is deliberately a separate decision -- so it needs a host,
+# not a rewrite. Actions is free at this volume on a private repo (~450 of
+# 2,000 monthly minutes), the secrets live in the repo's own store rather than
+# on somebody's laptop, and the schedule is version-controlled beside the code
+# it runs, which the n8n schedule never was.
+#
+# ONE GOTCHA WORTH KNOWING: GitHub disables scheduled workflows after 60 days
+# with no commits to the repository. It emails first. A repo under active work
+# never hits it; a repo left alone for a quarter does, silently, and the
+# dashboard would simply stop advancing.
+
+name: sync-daily
+
+on:
+  schedule:
+    # 09:00 UTC = 12:00 Africa/Cairo while Egypt is on summer time, 11:00 in
+    # winter. GitHub cron is UTC only and has no notion of DST, so one of the
+    # two halves of the year is an hour off whatever value is chosen here; an
+    # hour does not matter to a daily sync, and pretending otherwise would mean
+    # two cron lines and a guard.
+    #
+    # The local Windows task (sync/run-sync.ps1) does hold exactly 12:00 Cairo
+    # year-round, because it runs in the machine's own timezone and Windows
+    # applies the DST change itself. That task is what actually runs today --
+    # this workflow is blocked until the Actions minute allowance resets.
+    - cron: '0 9 * * *'
+  # So a sync can be triggered from the GitHub UI, on a phone, without a
+  # laptop or a checkout. This is what actually replaces "manual".
+  workflow_dispatch:
+
+# A run that overruns must never meet the next night's. Both would fetch the
+# same 35-day window and race on the delete-then-insert in invoice_lines_nightly.
+concurrency:
+  group: odoosync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    # A healthy run is 8-15 minutes: roughly 200-300 engine requests, paced by
+    # the engine's own 60/minute limit. 45 leaves room for a slow night and
+    # still kills a hang rather than burning the free-tier budget on it.
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: sync/requirements.txt
+
+      - name: Install
+        working-directory: sync
+        run: pip install -r requirements.txt
+
+      - name: Sync
+        working-directory: sync
+        env:
+          ENGINE_URL: ${{ secrets.ENGINE_URL }}
+          # MUST be a different key from the one the dashboard uses. The engine
+          # rate limits per key at 60/minute and a sync runs continuously at
+          # about 24; sharing one key lets a few page loads starve the sync into
+          # 429s. That is not hypothetical -- it killed a backfill at month 23
+          # of 27 during testing.
+          ENGINE_API_KEY: ${{ secrets.ENGINE_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          TIMEZONE: Asia/Baghdad
+        # -v because the only record of a run is this log. The engine is on
+        # Render's free plan and will always be cold when this fires; the first
+        # request absorbs the ~30-60s spin-up inside the client's 120s timeout,
+        # so a slow first line is normal and not a fault.
+        run: python -m odoosync all -v
